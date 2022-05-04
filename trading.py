@@ -1,8 +1,10 @@
 from abc import ABC, abstractmethod
+from asyncio.log import logger
 from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
+import secrets
 import time
 
 from requests import Session
@@ -11,6 +13,8 @@ from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order as IBOrder
 from ibapi.execution import ExecutionFilter
+from tda import auth, client
+from utils import get_secret, put_secret
 
 
 @dataclass
@@ -317,13 +321,48 @@ class IBAccount(Broker, EWrapper, EClient):
 
 
 class TDAAccount(Broker):
-    def __init__(self, logger) -> None:
+    def __init__(self, logger, id_secret, account_name) -> None:
         super().__init__()
 
         self.logger = logger
+        self.id_secret = id_secret
+        self.account_name = account_name
+        self.token_path = f"/tmp/tda_{account_name}_{secrets.token_urlsafe(8)}.json"
+        self.api_key = "HAQOYO2PWGK3URPBXPUNZTMKEX0FZJC8@AMER.OAUTHAP"
+
+        self.client = self._get_client()
 
     def _get_client(self):
-        raise NotImplementedError
+        secret = get_secret(self.id_secret)
+
+        with open(self.token_path, "w") as out_file:
+            json.dump(secret[f"token_{self.account_name}"], out_file)
+
+        try:
+            return auth.client_from_token_file(self.token_path, self.api_key)
+        except FileNotFoundError:
+            logger.error("TDA - Failed to load credentials from file")
+        except Exception as e:
+            logger.error(f"TDA - Unexpected {type(e)} error when setting up client")
+
+    def _cleanup(self):
+        """
+        Handles anything that needs to be done once trading has ended
+        for the day.
+        """
+        # TDA token may have been updated during operation,
+        # update the secrets in AWS with the latest token
+        secret = get_secret(self.id_secret)
+
+        with open(self.token_path, "r") as in_file:
+            token = in_file.read()
+
+        secret[f"token_{self.account_name}"] = token
+
+        put_secret(self.id_secret, secret)
+
+        # Delete token from machine
+        os.remove(self.token_path)
 
 
 class PaperAccountPolygon(Broker):
