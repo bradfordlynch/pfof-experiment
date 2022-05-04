@@ -1,0 +1,550 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime
+import json
+import os
+import time
+
+from requests import Session
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+from ibapi.order import Order as IBOrder
+from ibapi.execution import ExecutionFilter
+
+
+@dataclass
+class Order:
+    """
+    Class for keeping track of the state of an order
+    """
+
+    order_id: str
+    t_created: str
+    symbol: str
+    side: str
+    state: str
+    filled: bool
+    avg_price: float
+    quantity: int
+    cumulative_quantity: int
+    executions: list
+    events: list
+
+    def dollar_volume(self):
+        return self.avg_price * self.quantity
+
+
+class Broker(ABC):
+    """
+    Base class for all brokers. Wraps broker-specific business logic inside a common API.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @abstractmethod
+    def buy_market(self, symbol: str, quantity: int) -> Order:
+        """
+        Submits a market order to buy `quantity` shares of `symbol` at any price
+
+        Args:
+        symbol (`str`):
+            The trading symbol associated with the asset
+        quantity (`int`):
+            The number of shares to purchase
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def buy_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        """
+        Submits a limit order to buy `quantity` shares of `symbol` for no more than `limit_price`
+
+        Args:
+        symbol (`str`):
+            The trading symbol associated with the asset
+        quantity (`int`):
+            The number of shares to purchase
+        limit_price (`float`):
+            The maximum price to pay for the asset
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def sell_market(self, symbol: str, quantity: int) -> Order:
+        """
+        Submits a market order to sell `quantity` shares of `symbol` at any price
+
+        Args:
+        symbol (`str`):
+            The trading symbol associated with the asset
+        quantity (`int`):
+            The number of shares to sell
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def sell_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        """
+        Submits a limit order to sell `quantity` shares of `symbol` for no less than `limit_price`
+
+        Args:
+        symbol (`str`):
+            The trading symbol associated with the asset
+        quantity (`int`):
+            The number of shares to sell
+        limit_price (`float`):
+            The minimum price to recieve for the asset
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_order_info(self, order_id: str) -> Order:
+        """
+        Retrieves the latest state of the order associated with `order_id`
+
+        Args:
+        order_id (`str`):
+            The order_id associated with the order
+        """
+        raise NotImplementedError
+
+
+class IBAccount(Broker, EWrapper, EClient):
+    """
+    Interactive Broker's trading account
+
+    Args:
+    logger:
+        logging.Logger like object implementing debug, info, warn, and error methods
+    """
+
+    def __init__(self, logger) -> None:
+        EClient.__init__(self, self)
+
+        self.logger = logger
+        self.orders = dict()
+        self.order_queues = dict()
+
+    def nextValidId(self, orderId: int):
+        super().nextValidId(orderId)
+        self.nextorderId = orderId
+        print("The next valid order id is: ", self.nextorderId)
+
+    def orderStatus(
+        self,
+        orderId,
+        status,
+        filled,
+        remaining,
+        avgFillPrice,
+        permId,
+        parentId,
+        lastFillPrice,
+        clientId,
+        whyHeld,
+        mktCapPrice,
+    ) -> None:
+        """
+        Processes orderStatus events from the TWS API.
+        """
+        ts_event = time.time_ns()
+        try:
+            # Ensure that there is a record of the order in the IBAccount state,
+            # otherwise it might be an event associated with an extraneous order
+            # placed via the GUI or another TWS session.
+            assert orderId in self.orders
+            # Append the event to the order
+            event = {
+                "type": "orderStatus",
+                "ts": ts_event,
+                "order_id": orderId,
+                "status": status,
+                "q_filled": filled,
+                "q_remaining": remaining,
+                "avg_price": avgFillPrice,
+            }
+            self.orders[orderId].events.append(event)
+
+            # Update Order attributes with new data
+            if status == "Filled":
+                self.orders[orderId].state = "filled"
+                self.orders[orderId].filled = True
+            elif status == "Cancelled":
+                self.orders[orderId].state = "cancelled"
+            self.orders[orderId].avg_price = avgFillPrice
+            self.orders[orderId].cumulative_quantity = filled
+            self.logger.info(event)
+        except AssertionError:
+            self.logger.error(
+                f"IBKR - Got orderStatus event for orderId {orderId} which does not exist"
+            )
+
+    def openOrder(self, orderId, contract, order, orderState) -> None:
+        """
+        Processes openOrder events from the TWS API. Most orders lead to multiple
+        openOrder events, e.g., one when the order is first placed, another once
+        it is filled, and another once TWS computes the commissions associated with
+        the order.
+        """
+        ts_event = time.time_ns()
+        try:
+            assert orderId in self.orders
+            # Append the event to the order
+            event = {
+                "type": "openOrder",
+                "ts": ts_event,
+                "order_id": orderId,
+                "contract": contract.__dict__,
+                "order": order.__dict__,
+                "order_state": orderState.__dict__,
+            }
+            self.orders[orderId].events.append(event)
+            self.logger.info(event)
+        except AssertionError:
+            self.logger.error(
+                f"IBKR - Got openOrder event for orderId {orderId} which does not exist"
+            )
+
+    def execDetails(self, reqId, contract, execution) -> None:
+        """
+        Processes execDetails events from the TWS API. Orders may lead to multiple
+        execDetails events if the order is filled across venues or times.
+        """
+        ts_event = time.time_ns()
+        orderId = execution.orderId
+        try:
+            assert orderId in self.orders
+            # Append the event to the order
+            event = {
+                "type": "execDetails",
+                "ts": ts_event,
+                "order_id": orderId,
+                "req_id": reqId,
+                "contract": contract.__dict__,
+                "execution": execution.__dict__,
+            }
+            self.orders[orderId].events.append(event)
+            # Update Order attributes with new data
+            self.orders[orderId].avg_price = execution.avgPrice
+            self.orders[orderId].cumulative_quantity = execution.cumQty
+            self.logger.info(event)
+        except AssertionError:
+            self.logger.error(
+                f"IBKR - Got execDetails event for orderId {orderId} which does not exist"
+            )
+
+    def _get_stock_contract(
+        self, symbol, secType="STK", exchange="SMART", currency="USD"
+    ):
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = secType
+        contract.exchange = exchange
+        contract.currency = currency
+        return contract
+
+    def buy_market(self, symbol: str, quantity: int) -> Order:
+        return self._market_order(symbol, quantity, "BUY")
+
+    def buy_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        return self._limit_order(symbol, quantity, limit_price, "BUY")
+
+    def sell_market(self, symbol: str, quantity: int) -> Order:
+        return self._market_order(symbol, quantity, "SELL")
+
+    def sell_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        return self._limit_order(symbol, quantity, limit_price, "SELL")
+
+    def get_order_info(self, order_id: str) -> Order:
+        return self.orders[order_id]
+
+    def get_executions(self, symbol: str):
+        exec_filter = ExecutionFilter()
+        exec_filter.symbol = symbol
+
+        self.reqExecutions(0, exec_filter)
+
+    def _market_order(self, symbol: str, quantity: int, direction: str) -> Order:
+        contract = self._get_stock_contract(symbol)
+
+        order = IBOrder()
+        assert direction in ["BUY", "SELL"], f"Invalid direction {direction}"
+        order.action = direction
+        order.totalQuantity = quantity
+        order.orderType = "MKT"
+        order.tif = "GTC"
+        order.outsideRth = True
+
+        return self._place_order(contract, order)
+
+    def _limit_order(
+        self, symbol: str, quantity: int, limit_price: float, direction: str
+    ) -> Order:
+        contract = self._get_stock_contract(symbol)
+
+        order = IBOrder()
+        assert direction in ["BUY", "SELL"], f"Invalid direction {direction}"
+        order.action = direction
+        order.totalQuantity = quantity
+        order.orderType = "LMT"
+        order.lmtPrice = limit_price
+        order.tif = "GTC"
+        order.outsideRth = True
+
+        return self._place_order(contract, order)
+
+    def _place_order(self, contract: Contract, ib_order: IBOrder):
+        order_id = self.nextorderId
+        self.orders[order_id] = Order(
+            order_id,
+            time.time_ns(),
+            contract.symbol,
+            ib_order.action,
+            "live",
+            False,
+            -1,
+            ib_order.totalQuantity,
+            0,
+            [],
+            [],
+        )
+        self.placeOrder(order_id, contract, ib_order)
+        self.nextorderId += 1
+
+        return self.orders[order_id]
+
+
+class TDAAccount(Broker):
+    def __init__(self, logger) -> None:
+        super().__init__()
+
+        self.logger = logger
+
+    def _get_client(self):
+        raise NotImplementedError
+
+
+class PaperAccountPolygon(Broker):
+    """
+    Paper trading account implemented using data from Polygon.io
+
+    Args:
+        date (`str`, *optional*):
+            Specific date, in ISO 8601 format (YYYY-MM-DD), to use when getting historical pricing data, e.g., for back-testing
+    """
+
+    uri_quotes = "https://api.polygon.io/v3/quotes/{symbol}?timestamp.lte={timestamp}&limit={n}&order=desc"
+    uri_trades = "https://api.polygon.io/v3/trades/{symbol}?timestamp.lte={timestamp}&limit={n}&order=desc"
+
+    def __init__(self, date=None) -> None:
+        super().__init__()
+
+        self.orders = []
+        self.api_key = os.environ.get("PG_API_KEY")
+        self.client = Session()
+
+        if date:
+            # Running as of a specific date
+            self.t_init = time.time_ns()
+            try:
+                # Determine market open on that date in seconds
+                market_open = time.mktime(
+                    datetime.strptime(date, "%Y-%m-%d").timetuple()
+                ) + ((9.5 - 3) * 60 * 60)
+
+                # Set the offset in nanoseconds
+                self.offset = int(market_open * 1e9)
+            except:
+                raise ValueError("date must be in the format YYYY-MM-DD")
+        else:
+            # Running in real-time
+            self.t_init = 0
+            self.offset = 0
+
+    def buy_market(self, symbol: str, quantity: int) -> Order:
+        return self._market_order(symbol, quantity, "buy")
+
+    def buy_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        return self._limit_order(symbol, quantity, limit_price, "buy")
+
+    def sell_market(self, symbol: str, quantity: int) -> Order:
+        return self._market_order(symbol, quantity, "sell")
+
+    def sell_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        return self._limit_order(symbol, quantity, limit_price, "sell")
+
+    def get_order_info(self, order_id: int) -> Order:
+        order = self.orders[order_id]
+
+        if order.filled or order.state == "cancelled":
+            # Order state is fixed
+            return order
+        else:
+            # Order is live and unfilled, update the state of the order
+            # Current time may be relative to a back-test time
+            ts = time.time_ns() - self.t_init + self.offset
+
+            # Get market data
+            uri = self.uri_trades.format(symbol=order.symbol, timestamp=ts, n=1000)
+            resp = self.client.get(uri, params={"apiKey": self.api_key})
+            assert resp.status_code == 200, "Request for market data failed"
+            trades = resp.json()["results"]
+
+            for trade in reversed(trades):  # Query returns trades desc by ts
+                if trade["sip_timestamp"] > order.t_created:
+                    price = trade["price"]
+                    if order.side == "buy":
+                        filled = order.avg_price >= price
+                    else:
+                        filled = order.avg_price <= price
+
+                    if filled:
+                        # Update order status to reflect fill
+                        order.state = "filled"
+                        order.filled = filled
+                        order.cumulative_quantity = order.quantity
+                        break
+
+            return order
+
+    def cancel_order(self, order_id: int) -> Order:
+        order = self.orders[order_id]
+        if order.state == "live":
+            order = self.get_order_info(order_id)
+
+        if not order.filled:
+            order.state = "cancelled"
+
+        return order
+
+    def _market_order(self, symbol: str, quantity: int, direction: str) -> Order:
+        order_id = len(self.orders)
+
+        # Current time may be relative to a back-test time
+        ts = time.time_ns() - self.t_init + self.offset
+
+        # Get market info from this time
+        uri = self.uri_quotes.format(symbol=symbol, timestamp=ts, n=1)
+        resp = self.client.get(uri, params={"apiKey": self.api_key})
+        assert resp.status_code == 200, "Request for market data failed"
+
+        if direction == "buy":
+            # Assume you pay the NBO
+            avg_price = resp.json()["results"][0]["ask_price"]
+        elif direction == "sell":
+            # Assume you pay the NBB
+            avg_price = resp.json()["results"][0]["bid_price"]
+        else:
+            raise ValueError("direction must be buy or sell")
+
+        self.orders.append(
+            Order(
+                order_id,
+                ts,
+                symbol,
+                direction,
+                "filled",
+                True,
+                avg_price,
+                quantity,
+                quantity,
+                [],
+                [],
+            )
+        )
+
+        return self.orders[-1]
+
+    def _limit_order(
+        self, symbol: str, quantity: int, limit_price: float, direction: str
+    ) -> Order:
+        order_id = len(self.orders)
+
+        # Current time may be relative to a back-test time
+        ts = time.time_ns() - self.t_init + self.offset
+
+        # Get market info from this time
+        uri = self.uri_quotes.format(symbol=symbol, timestamp=ts, n=1)
+        resp = self.client.get(uri, params={"apiKey": self.api_key})
+        assert resp.status_code == 200, "Request for market data failed"
+
+        state = "live"
+        filled = False
+        if direction == "buy":
+            # Assume you pay the NBO
+            ask_price = resp.json()["results"][0]["ask_price"]
+            if ask_price <= limit_price:
+                avg_price = ask_price
+                state = "filled"
+                filled = True
+            else:
+                avg_price = limit_price
+        elif direction == "sell":
+            # Assume you pay the NBB
+            bid_price = resp.json()["results"][0]["bid_price"]
+            if bid_price >= limit_price:
+                avg_price = bid_price
+                state = "filled"
+                filled = True
+            else:
+                avg_price = limit_price
+        else:
+            raise ValueError("direction must be buy or sell")
+
+        cumulative_quantity = 0
+        if filled:
+            cumulative_quantity = quantity
+
+        self.orders.append(
+            Order(
+                order_id,
+                ts,
+                symbol,
+                direction,
+                state,
+                filled,
+                avg_price,
+                quantity,
+                cumulative_quantity,
+                [],
+                [],
+            )
+        )
+
+        return self.orders[-1]
+
+    def _paginate(self, url, max_pages=None) -> list:
+        results = []
+        next_url = url
+        n = 0
+
+        while next_url:
+            try:
+                resp = self.client.get(next_url, params={"apiKey": self.api_key})
+            except Exception as e:
+                print(f"Unexpected {type(e)}: {url}")
+                return []
+            n += 1
+
+            if resp.status_code == 200:
+                data = resp.json()
+                if "results" in data:
+                    results.extend(data["results"])
+
+                if "next_url" in data:
+                    next_url = data["next_url"]
+                else:
+                    next_url = None
+
+            else:
+                print(f"{resp.status_code} error when getting page: {next_url}")
+                return []
+
+            if max_pages is not None:
+                if n >= max_pages:
+                    print("Hit pagination limit")
+                    break
+
+        return results
