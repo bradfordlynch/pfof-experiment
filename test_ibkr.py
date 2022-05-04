@@ -5,6 +5,7 @@ import time
 from trading import IBAccount
 from ibapi.contract import Contract
 from ibapi.order import *
+from utils import PrintLogger
 
 
 def run_loop():
@@ -19,26 +20,6 @@ def Stock_contract(symbol, secType="STK", exchange="SMART", currency="USD"):
     contract.exchange = exchange
     contract.currency = currency
     return contract
-
-
-class PrintLogger:
-    def __init__(self) -> None:
-        pass
-
-    def debug(self, output):
-        self._print("DEBUG", output)
-
-    def info(self, output):
-        self._print("INFO", output)
-
-    def warn(self, output):
-        self._print("WARN", output)
-
-    def error(self, output):
-        self._print("ERROR", output)
-
-    def _print(self, level, output):
-        print(f"{level} - {output}")
 
 
 if __name__ == "__main__":

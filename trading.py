@@ -1,8 +1,6 @@
 from abc import ABC, abstractmethod
-from asyncio.log import logger
 from dataclasses import dataclass
 from datetime import datetime
-import json
 import os
 import secrets
 import time
@@ -13,7 +11,16 @@ from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order as IBOrder
 from ibapi.execution import ExecutionFilter
-from tda import auth, client
+import tda
+from tda import auth
+from tda.orders.equities import (
+    equity_buy_limit,
+    equity_buy_market,
+    equity_sell_limit,
+    equity_sell_market,
+)
+from tda.orders.common import Duration
+from tda.orders.common import Session as TDASession
 from utils import get_secret, put_secret
 
 
@@ -114,6 +121,17 @@ class Broker(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def cancel_order(self, order_id: str) -> Order:
+        """
+        Cancels the order associated with `order_id` if it has not already filled
+
+         Args:
+         order_id (`str`):
+             The order_id associated with the order
+        """
+        raise NotImplementedError
+
 
 class IBAccount(Broker, EWrapper, EClient):
     """
@@ -129,7 +147,6 @@ class IBAccount(Broker, EWrapper, EClient):
 
         self.logger = logger
         self.orders = dict()
-        self.order_queues = dict()
 
     def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
@@ -330,20 +347,133 @@ class TDAAccount(Broker):
         self.token_path = f"/tmp/tda_{account_name}_{secrets.token_urlsafe(8)}.json"
         self.api_key = "HAQOYO2PWGK3URPBXPUNZTMKEX0FZJC8@AMER.OAUTHAP"
 
-        self.client = self._get_client()
+        self.client, self.account_id = self._setup_client()
 
-    def _get_client(self):
+        self.orders = dict()
+
+    def buy_market(self, symbol: str, quantity: int) -> Order:
+        order = equity_buy_market(symbol, quantity).build()
+
+        return self._place_order(order)
+
+    def buy_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        order = (
+            equity_buy_limit(symbol, quantity, limit_price)
+            .set_duration(Duration.GOOD_TILL_CANCEL)
+            .set_session(TDASession.SEAMLESS)
+            .build()
+        )
+
+        return self._place_order(order)
+
+    def sell_market(self, symbol: str, quantity: int) -> Order:
+        order = equity_sell_market(symbol, quantity).build()
+
+        return self._place_order(order)
+
+    def sell_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        order = (
+            equity_sell_limit(symbol, quantity, limit_price)
+            .set_duration(Duration.GOOD_TILL_CANCEL)
+            .set_session(TDASession.SEAMLESS)
+            .build()
+        )
+
+        return self._place_order(order)
+
+    def get_order_info(self, order_id: str) -> Order:
+        # Get order info from TDA
+        ts_event = time.time_ns()
+        resp = self.client.get_order(order_id, self.account_id)
+        try:
+            assert resp.status_code == 200
+        except Exception as e:
+            self.logger.error(
+                f"TDA - Failed to get order {order_id}. Received {resp.status_code}"
+            )
+
+            return self.orders[order_id]
+
+        # Update order state
+        order_state = resp.json()
+        self.orders[order_id].filled = (
+            order_state["quantity"] == order_state["filledQuantity"]
+        )
+        self.orders[order_id].avg_price = order_state["price"]
+        self.orders[order_id].cumulative_quantity = order_state["filledQuantity"]
+        self.orders[order_id].events.append(
+            {"type": "get_order_info", "ts": ts_event, "order_state": order_state}
+        )
+
+        return self.orders[order_id]
+
+    def cancel_order(self, order_id: str) -> Order:
+        resp = self.client.cancel_order(order_id, self.account_id)
+        try:
+            assert resp.status_code == 200
+            self.orders[order_id].state == "cancelled"
+        except Exception as e:
+            self.logger.error(
+                f"TDA - Failed to cancel order {order_id}. Received {resp.status_code}"
+            )
+            self.logger.error(f"TDA - {resp.text}")
+
+        return self.orders[order_id]
+
+    def _place_order(self, tda_order):
+        ts_order_submit = time.time_ns()
+        resp = self.client.place_order(self.account_id, tda_order)
+        order_id = tda.utils.Utils(self.client, self.account_id).extract_order_id(resp)
+
+        self.orders[order_id] = Order(
+            order_id,
+            ts_order_submit,
+            tda_order["orderLegCollection"][0]["instrument"]["symbol"],
+            tda_order["orderLegCollection"][0]["instruction"],
+            "live",
+            False,
+            -1,
+            tda_order["orderLegCollection"][0]["quantity"],
+            0,
+            [],
+            [],
+        )
+
+        return self.orders[order_id]
+
+    def _setup_client(self):
         secret = get_secret(self.id_secret)
 
         with open(self.token_path, "w") as out_file:
-            json.dump(secret[f"token_{self.account_name}"], out_file)
+            out_file.write(secret[f"token_{self.account_name}"])
 
         try:
-            return auth.client_from_token_file(self.token_path, self.api_key)
+            client = auth.client_from_token_file(self.token_path, self.api_key)
         except FileNotFoundError:
-            logger.error("TDA - Failed to load credentials from file")
+            self.logger.error("TDA - Failed to load credentials from file")
+            raise
         except Exception as e:
-            logger.error(f"TDA - Unexpected {type(e)} error when setting up client")
+            self.logger.error(
+                f"TDA - Unexpected {type(e)} error when setting up client"
+            )
+            self.logger.error(f"TDA - {e}")
+            raise
+
+        try:
+            account_id = secret[f"account_{self.account_name}"]
+        except KeyError:
+            self.logger.error(
+                f"TDA - Secret is missing account id for account named {self.account_name}"
+            )
+            raise
+        except Exception as e:
+            self.logger.error(
+                f"TDA - Unexpected {type(e)} error when getting account id"
+            )
+            self.logger.error(f"TDA - {e}")
+            raise
+
+        return client, account_id
 
     def _cleanup(self):
         """
