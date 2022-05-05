@@ -84,12 +84,12 @@ def _listener_process(queue: Queue, configurer: Callable, fn_log: str) -> None:
     https://docs.python.org/3/howto/logging-cookbook.html#logging-to-a-single-file-from-multiple-processes
     """
     configurer(fn_log)
+    logger = logging.getLogger()
     while True:
         try:
             record = queue.get()
             if record is None:
                 break
-            logger = logging.getLogger(record.name)
             logger.handle(record)
         except Exception:
             import sys, traceback
@@ -129,30 +129,6 @@ def _trading_process(
     # Setup brokerage account
     account = account_constructor(logger)
 
-    # # IBKR account needs to establish a socket with TWS
-    # if isinstance(account, IBAccount):
-
-    #     def run_loop():
-    #         account.run()
-
-    #     account.connect("127.0.0.1", 7496, 124)
-
-    #     account.nextorderId = None
-
-    #     # Start the socket in a thread
-    #     api_thread = threading.Thread(target=run_loop, daemon=True)
-    #     api_thread.start()
-
-    #     # Check if the API is connected via orderid
-    #     while True:
-    #         if isinstance(account.nextorderId, int):
-    #             logger.info("IBKR - Connected")
-    #             break
-    #         else:
-    #             logger.info("IBKR - Waiting for connection")
-    #             time.sleep(1)
-
-    # Account's event loop
     while True:
         msg = action_queue.get()
         t_recv = time.time_ns()
@@ -484,6 +460,7 @@ if __name__ == "__main__":
         worker.start()
 
     # Let the experiment run
+    logger.info("Joining observation processes")
     for worker in obs_procs:
         worker.join()
     logger.info("All observation processes exited")
@@ -493,7 +470,7 @@ if __name__ == "__main__":
         q.put(None)
 
     for worker in trading_procs:
-        worker.join()
+        worker.join(5)
     logger.info("All account processes exited")
 
     # Put experiment results in S3

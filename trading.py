@@ -783,7 +783,7 @@ class RobinhoodAccount(Broker):
             username = secret[f"u_{self.account_name}"]
             password = secret[f"p_{self.account_name}"]
             otp_seed = secret[f"totp_{self.account_name}"]
-            self.logger.error(f"{self.account_name} - Successfully retrieved secrets")
+            self.logger.info(f"{self.account_name} - Successfully retrieved secrets")
         except Exception as e:
             self.logger.error(
                 f"{self.account_name} - Unexpected {type(e)} when getting secrets"
@@ -793,7 +793,7 @@ class RobinhoodAccount(Broker):
         # Generate time-based one time password
         try:
             totp = pyotp.TOTP(otp_seed).now()
-            self.logger.error(f"{self.account_name} - Successfully got TOTP")
+            self.logger.info(f"{self.account_name} - Successfully got TOTP")
         except Exception as e:
             self.logger.error(
                 f"{self.account_name} - Unexpected {type(e)} when getting TOTP"
@@ -805,7 +805,7 @@ class RobinhoodAccount(Broker):
             login = rh_client.login(
                 username, password, mfa_code=totp, store_session=False, cred_path="/tmp"
             )
-            self.logger.error(f"{self.account_name} - Successfully logged in")
+            self.logger.info(f"{self.account_name} - Successfully logged in")
         except Exception as e:
             self.logger.error(
                 f"{self.account_name} - Unexpected {type(e)} when logging into account"
