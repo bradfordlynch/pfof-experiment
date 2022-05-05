@@ -74,7 +74,8 @@ def _listener_configurer(fn_log: str) -> None:
 def worker_configurer(queue: Queue) -> None:
     h = logging.handlers.QueueHandler(queue)
     root = logging.getLogger()
-    root.addHandler(h)
+    if not root.handlers:
+        root.addHandler(h)
     root.setLevel(logging.INFO)
 
 
@@ -108,7 +109,8 @@ def _setup_mp_logger(fn_log: str):
 
     h = logging.handlers.QueueHandler(queue)
     logger = logging.getLogger()
-    logger.addHandler(h)
+    if not logger.handlers:
+        logger.addHandler(h)
     logger.setLevel(logging.INFO)
 
     return queue, logger, listener
