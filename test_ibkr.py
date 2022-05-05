@@ -61,7 +61,7 @@ if __name__ == "__main__":
     # print(f"Took {(time.time() - _start) * 1000:.2f} ms")
     _start = time.time()
     # app.get_executions("AAPL")
-    buy_order = app.buy_limit("AAPL", 1, 159.7)
+    buy_order = app.buy_limit("AAPL", 1, 159)
     # buy_order = app.buy_market("AAPL", 1)
     print(buy_order)
     # print(buy_order)
@@ -72,13 +72,20 @@ if __name__ == "__main__":
     print(order)
 
     _start = time.time()
-    sell_order = app.sell_limit("AAPL", 1, 159.5)
+    # sell_order = app.sell_limit("AAPL", 1, 159.5)
+    cancelled = app.cancel_order(buy_order.order_id)
+    print("State from cancel function:")
+    print(cancelled)
     print(f"Took {(time.time() - _start) * 1000:.2f} ms")
-    time.sleep(1)
+    # time.sleep(1)
 
-    sell_order_updated = app.get_order_info(sell_order.order_id)
+    # order = app.get_order_info(buy_order.order_id)
+    # print("After cancelling:")
+    # print(order)
 
-    time.sleep(1)  # Sleep interval to allow time for incoming price data
+    # sell_order_updated = app.get_order_info(sell_order.order_id)
+
+    # time.sleep(1)  # Sleep interval to allow time for incoming price data
 
     # with open("ibkr_test_output.pkl", "wb") as out_file:
     #     pickle.dump(

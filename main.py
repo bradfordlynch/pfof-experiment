@@ -1,20 +1,29 @@
 import argparse
 from collections.abc import Callable
-import concurrent.futures
+import secrets
 from datetime import datetime
+from functools import partial
 import json
 import logging
 import logging.handlers
 import multiprocessing
 from multiprocessing import Queue
 import os
+import pickle
 import requests
+import threading
 import time
 
-from trading import Broker, PaperAccountPolygon
+import boto3
+from trading import Broker, PaperAccountPolygon, IBAccount, TDAAccount, RobinhoodAccount
+from utils import generate_experiment
 
 PG_API_KEY = os.environ.get("PG_API_KEY")
-MAX_WAIT_BEFORE_CANCEL = 5
+MAX_WAIT_BEFORE_CANCEL_MIN = 5  # Minutes
+ACCOUNT_NAME_BROKER_MAP = {
+    "IBKR": IBAccount,
+    "TDA": TDAAccount,
+}
 
 
 def _parse_args():
@@ -30,6 +39,24 @@ def _parse_args():
         type=bool,
         default=False,
         help="whether to run the experiment using paper accounts",
+    )
+    parser.add_argument(
+        "--gen_experiment",
+        type=bool,
+        default=False,
+        help="generates a set of trades for testing",
+    )
+    parser.add_argument(
+        "--aws_secret",
+        type=str,
+        default="pfof-exp",
+        help="name or ARN of secrets in AWS",
+    )
+    parser.add_argument(
+        "--aws_bucket",
+        type=str,
+        default="pfof-experiment",
+        help="AWS bucket for storing experiment results",
     )
     args = parser.parse_args()
 
@@ -100,14 +127,39 @@ def _trading_process(
     logger = logging.getLogger()
 
     # Setup brokerage account
-    account = account_constructor()
+    account = account_constructor(logger)
 
+    # # IBKR account needs to establish a socket with TWS
+    # if isinstance(account, IBAccount):
+
+    #     def run_loop():
+    #         account.run()
+
+    #     account.connect("127.0.0.1", 7496, 124)
+
+    #     account.nextorderId = None
+
+    #     # Start the socket in a thread
+    #     api_thread = threading.Thread(target=run_loop, daemon=True)
+    #     api_thread.start()
+
+    #     # Check if the API is connected via orderid
+    #     while True:
+    #         if isinstance(account.nextorderId, int):
+    #             logger.info("IBKR - Connected")
+    #             break
+    #         else:
+    #             logger.info("IBKR - Waiting for connection")
+    #             time.sleep(1)
+
+    # Account's event loop
     while True:
         msg = action_queue.get()
         t_recv = time.time_ns()
 
         if msg is None:
             # Stop signal
+            account.cleanup()
             break
 
         if msg["action"] == "buy":
@@ -126,6 +178,8 @@ def _trading_process(
                 )
         elif msg["action"] == "cancel":
             order = account.cancel_order(msg["order_id"])
+        elif msg["action"] == "get_order":
+            order = account.get_order_info(msg["order_id"])
         else:
             raise NotImplementedError(f"Unsupported action: {msg['action']}")
 
@@ -142,7 +196,8 @@ def _observation_process(
     observation: dict,
     logging_queue: Queue,
     configurer: Callable,
-) -> list:
+    final_results_queue: Queue,
+) -> None:
     # Setup within process logging
     configurer(logging_queue)
     logger = logging.getLogger()
@@ -211,7 +266,8 @@ def _observation_process(
                 logger.info(observation)
                 return False
 
-            buy["quantity"] = round(observation["order_size"] / limit_price)
+            # Convert to shares, buying at least one share
+            buy["quantity"] = max(round(observation["order_size"] / limit_price), 1)
             break
 
     # Nearing time to submit order, loop until time to submit
@@ -231,7 +287,7 @@ def _observation_process(
 
     # If the order didn't fill, then we wait until it does fill or
     # up to five minutes before cancelling the order
-    ts_cancel = ts_open_utc_ns + MAX_WAIT_BEFORE_CANCEL * 60 * 1e9
+    ts_cancel = ts_open_utc_ns + MAX_WAIT_BEFORE_CANCEL_MIN * 60 * 1e9
     while not order.filled:
         ts_now = time.time_ns()
         if ts_now >= ts_cancel:
@@ -261,6 +317,8 @@ def _observation_process(
             )
             time.sleep(t_sleep)
 
+    observation["order_to_open"] = order
+
     # Prepare to sell position
     if order.cumulative_quantity > 0:
         sell = {
@@ -286,8 +344,22 @@ def _observation_process(
                 )
                 time.sleep(t_sleep)
 
+        # Get cancellation result
         msg = obs_queue.get()
-        order = msg["order"]
+        observation["events"].append(msg)
+
+        # Get final state of order
+        sell_order = msg["order"]
+        account_queues[account_name].put(
+            {
+                "ob_id": observation["id"],
+                "action": "get_order",
+                "order_id": sell_order.order_id,
+            }
+        )
+        msg = obs_queue.get()
+        sell_order = msg["order"]
+        observation["order_to_close"] = sell_order
         logger.info(f'Ob {observation["id"]} - Closed position: {msg}')
         observation["events"].append(msg)
     else:
@@ -295,7 +367,9 @@ def _observation_process(
 
     logger.info(f'Ob {observation["id"]} - Final - {observation}')
 
-    return True
+    final_results_queue.put(observation)
+
+    return None
 
 
 if __name__ == "__main__":
@@ -303,20 +377,25 @@ if __name__ == "__main__":
     args = _parse_args()
 
     # Setup logging
-    fn_log = f'{args.exp.rsplit(".", 1)[0]}_{today}.log'
+    fn_log = f'{args.exp.rsplit(".", 1)[0]}_{today}_{secrets.token_urlsafe(8)}.log'
     logging_queue, logger, listener = _setup_mp_logger(fn_log)
 
     # Load experiment design
     with open(args.exp, "r") as in_file:
         experiment = json.load(in_file)
 
-    obs = [ob for ob in experiment if ob["date_open"] == today]
-    logger.info(f"Today has {len(obs)} observations to run")
+    if args.gen_experiment:
+        obs = generate_experiment()
+        logger.info(f"Test experiment has {len(obs)} observations to run")
+    else:
+        obs = [ob for ob in experiment if ob["date_open"] == today]
+        logger.info(f"Today has {len(obs)} observations to run")
 
     # Setup queues for observations and brokers
     obs_queues = {ob["id"]: Queue(-1) for ob in obs}
     account_names = set([ob["account"] for ob in obs])
     account_queues = {k: Queue(-1) for k in account_names}
+    final_results_queue = Queue(-1)
 
     # Setup processes for trading
     trading_proc_inputs = []
@@ -334,7 +413,52 @@ if __name__ == "__main__":
             )
     else:
         logger.warning("Running experiment using real-ish money")
-        raise NotImplementedError
+        n_ibkr = 0
+        n_hood = 0
+        for name, q in account_queues.items():
+            account_type = name.split("_")[0]
+            if account_type == "IBKR":
+                try:
+                    # The IBAccount connects to TWS which is a single account.
+                    # As a result, only one IB account is supported at a time.
+                    # Could run multiple instances of TWS with different ports
+                    # if multiple accounts is necessary...
+                    assert n_ibkr == 0
+                    n_ibkr += 1
+                except AssertionError:
+                    raise NotImplementedError("Multiple IB accounts is not supported")
+                constructor = IBAccount
+            elif account_type == "TDA":
+                constructor = partial(
+                    TDAAccount,
+                    id_secret=args.aws_secret,  # Credentials are stored in AWS
+                    account_name=name,  # Account name associated with credentials
+                )
+            elif account_type == "Robinhood":
+                try:
+                    assert n_hood == 0
+                    n_hood += 1
+                except AssertionError:
+                    raise NotImplementedError(
+                        "Multiple Robinhood accounts is not supported"
+                    )
+                constructor = partial(
+                    RobinhoodAccount,
+                    id_secret=args.aws_secret,  # Credentials are stored in AWS
+                    account_name=name,  # Account name associated with credentials
+                )
+            else:
+                raise NotImplementedError(f"Unsupported account {name}")
+
+            trading_proc_inputs.append(
+                (
+                    q,
+                    logging_queue,
+                    obs_queues,
+                    worker_configurer,
+                    constructor,
+                )
+            )
 
     trading_procs = []
     for inputs in trading_proc_inputs:
@@ -353,6 +477,7 @@ if __name__ == "__main__":
                 ob,
                 logging_queue,
                 worker_configurer,
+                final_results_queue,
             ),
         )
         obs_procs.append(worker)
@@ -361,6 +486,7 @@ if __name__ == "__main__":
     # Let the experiment run
     for worker in obs_procs:
         worker.join()
+    logger.info("All observation processes exited")
 
     # Shutdown trading processes
     for k, q in account_queues.items():
@@ -368,6 +494,31 @@ if __name__ == "__main__":
 
     for worker in trading_procs:
         worker.join()
+    logger.info("All account processes exited")
+
+    # Put experiment results in S3
+    logger.info("Putting results in S3")
+    s3 = boto3.client("s3")
+    exp_folder = os.path.splitext(fn_log)[0]
+
+    results = []
+    while True:
+        try:
+            results.append(final_results_queue.get_nowait())
+        except:
+            break
+
+    s3.put_object(
+        Bucket=args.aws_bucket,
+        Key=os.path.join(exp_folder, "result_objects.pkl"),
+        Body=pickle.dumps(results),
+    )
+    logger.info("Uploaded result objects to S3")
+
+    logger.info("Uploading logs to S3, have a nice day")
+    s3.upload_file(
+        Filename=fn_log, Bucket=args.aws_bucket, Key=os.path.join(exp_folder, fn_log)
+    )
 
     # Shut down logging
     logging_queue.put_nowait(None)

@@ -1,16 +1,21 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 import os
 import secrets
 import time
+import threading
+from typing import Callable
 
 from requests import Session
+import pyotp
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order as IBOrder
 from ibapi.execution import ExecutionFilter
+import robin_stocks.robinhood as rh_client
 import tda
 from tda import auth
 from tda.orders.equities import (
@@ -48,11 +53,12 @@ class Order:
 
 class Broker(ABC):
     """
-    Base class for all brokers. Wraps broker-specific business logic inside a common API.
+    Base class for all brokers. Wrap broker-specific business logic inside a common API.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, logger) -> None:
         super().__init__()
+        self.logger = logger
 
     @abstractmethod
     def buy_market(self, symbol: str, quantity: int) -> Order:
@@ -132,10 +138,17 @@ class Broker(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def cleanup(self) -> None:
+        """
+        Do anything that needs to be done when the account is shut down.
+        """
+        raise NotImplementedError
+
 
 class IBAccount(Broker, EWrapper, EClient):
     """
-    Interactive Broker's trading account
+    Live trading account at Interactive Broker
 
     Args:
     logger:
@@ -147,6 +160,26 @@ class IBAccount(Broker, EWrapper, EClient):
 
         self.logger = logger
         self.orders = dict()
+
+        def run_loop():
+            self.run()
+
+        self.connect("127.0.0.1", 7496, 124)
+
+        self.nextorderId = None
+
+        # Start the socket in a thread
+        self.api_thread = threading.Thread(target=run_loop, daemon=True)
+        self.api_thread.start()
+
+        # Check if the API is connected via orderid
+        while True:
+            if isinstance(self.nextorderId, int):
+                logger.info("IBKR - Connected")
+                break
+            else:
+                logger.info("IBKR - Waiting for connection")
+                time.sleep(1)
 
     def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
@@ -281,6 +314,40 @@ class IBAccount(Broker, EWrapper, EClient):
     def get_order_info(self, order_id: str) -> Order:
         return self.orders[order_id]
 
+    def cancel_order(self, order_id: str) -> Order:
+        if self.orders[order_id].filled:
+            # Order has been filled, no need to cancel
+            return self.orders[order_id]
+        else:
+            # Cancel order
+            self.cancelOrder(order_id)
+
+            # Order update is async, wait up to 500ms for state to update
+            ts_wait_start = time.time()
+            order = self.orders[order_id]
+            while order.state != "cancelled":
+                order = self.orders[order_id]
+
+                if time.time() - ts_wait_start >= 0.5:
+                    self.logger.error(
+                        f"IBKR - Timed out while waiting for order {order_id} cancelation"
+                    )
+                    break
+
+            if order.state == "cancelled":
+                self.logger.info(
+                    f"IBKR - Waited {(time.time() - ts_wait_start) * 1000:.2f} ms for order {order_id} cancelation"
+                )
+
+            return order
+
+    def cleanup(self):
+        # Disconnect from TWS
+        self.disconnect()
+
+        # Wait or timeout for socket thread to shutdown
+        self.api_thread.join(2.0)
+
     def get_executions(self, symbol: str):
         exec_filter = ExecutionFilter()
         exec_filter.symbol = symbol
@@ -338,9 +405,19 @@ class IBAccount(Broker, EWrapper, EClient):
 
 
 class TDAAccount(Broker):
-    def __init__(self, logger, id_secret, account_name) -> None:
-        super().__init__()
+    """
+    Live trading account at TDAmeritrade
 
+    Args:
+        logger:
+            logging.Logger like object implementing debug, info, warn, and error methods
+        id_secret (`str`):
+            Name of the secret in AWS
+        account_name:
+            Name of the account as referenced in the secret
+    """
+
+    def __init__(self, logger, id_secret: str, account_name: str) -> None:
         self.logger = logger
         self.id_secret = id_secret
         self.account_name = account_name
@@ -399,8 +476,16 @@ class TDAAccount(Broker):
         self.orders[order_id].filled = (
             order_state["quantity"] == order_state["filledQuantity"]
         )
-        self.orders[order_id].avg_price = order_state["price"]
+        if self.orders[order_id].filled:
+            self.orders[order_id].state = "filled"
         self.orders[order_id].cumulative_quantity = order_state["filledQuantity"]
+
+        # TDA doesn't provide a VWAP, need to compute it ourselves
+        if "orderActivityCollection" in order_state:
+            self.orders[order_id].avg_price = self._compute_avg_price(
+                order_state["orderActivityCollection"]
+            )
+
         self.orders[order_id].events.append(
             {"type": "get_order_info", "ts": ts_event, "order_state": order_state}
         )
@@ -408,19 +493,43 @@ class TDAAccount(Broker):
         return self.orders[order_id]
 
     def cancel_order(self, order_id: str) -> Order:
-        resp = self.client.cancel_order(order_id, self.account_id)
-        try:
-            assert resp.status_code == 200
-            self.orders[order_id].state == "cancelled"
-        except Exception as e:
-            self.logger.error(
-                f"TDA - Failed to cancel order {order_id}. Received {resp.status_code}"
+        # Get the current state of the order
+        order = self.get_order_info(order_id)
+
+        if order.filled:
+            # Order filled, no need to cancel it
+            return order
+        else:
+            # Order isn't filled, need to cancel it
+            ts_cancel = time.time_ns()
+            resp = self.client.cancel_order(order_id, self.account_id)
+            cancelled = False
+            try:
+                assert resp.status_code == 200
+                self.orders[order_id].state = "cancelled"
+                cancelled = True
+            except Exception as e:
+                self.logger.error(
+                    f"TDA - Failed to cancel order {order_id}. Received {resp.status_code}"
+                )
+                self.logger.error(f"TDA - {resp.text}")
+
+            try:
+                body = resp.json()
+            except:
+                body = resp.text
+
+            self.orders[order_id].events.append(
+                {"type": "cancel_order", "ts": ts_cancel, "resp": body}
             )
-            self.logger.error(f"TDA - {resp.text}")
 
-        return self.orders[order_id]
+            return self.orders[order_id]
 
-    def _place_order(self, tda_order):
+    def _place_order(self, tda_order) -> Order:
+        """
+        Submits a TDA order template for execution and converts the response into an
+        Order object
+        """
         ts_order_submit = time.time_ns()
         resp = self.client.place_order(self.account_id, tda_order)
         order_id = tda.utils.Utils(self.client, self.account_id).extract_order_id(resp)
@@ -440,6 +549,27 @@ class TDAAccount(Broker):
         )
 
         return self.orders[order_id]
+
+    def _compute_avg_price(self, activity_collection):
+        """
+        Computes the avaerage price based on one or more executions.
+
+        See TDA for schema:
+        https://developer.tdameritrade.com/account-access/apis/get/accounts/%7BaccountId%7D/orders/%7BorderId%7D-0
+
+        Args:
+            activity_collection (`list`):
+                List of events associated with the order
+        """
+        q = 0
+        p = 0
+
+        for event in activity_collection:
+            if event["activityType"] == "EXECUTION":
+                q += event["quantity"]
+                p += event["quantity"] * event["executionLegs"][0]["price"]
+
+        return p / q
 
     def _setup_client(self):
         secret = get_secret(self.id_secret)
@@ -475,7 +605,7 @@ class TDAAccount(Broker):
 
         return client, account_id
 
-    def _cleanup(self):
+    def cleanup(self):
         """
         Handles anything that needs to be done once trading has ended
         for the day.
@@ -495,6 +625,194 @@ class TDAAccount(Broker):
         os.remove(self.token_path)
 
 
+class RobinhoodAccount(Broker):
+    """
+    Live trading account at Robinhood
+
+    Args:
+        logger:
+            logging.Logger like object implementing debug, info, warn, and error methods
+        id_secret (`str`):
+            Name of the secret in AWS
+        account_name:
+            Name of the account as referenced in the secret
+    """
+
+    def __init__(self, logger, id_secret: str, account_name: str) -> None:
+        self.logger = logger
+        self.id_secret = id_secret
+        self.account_name = account_name
+
+        # Authenticate the robin_stocks library with HOOD
+        self._setup_client()
+
+        self.orders = dict()
+
+    def buy_market(self, symbol: str, quantity: int) -> Order:
+        order_function = partial(
+            rh_client.order_buy_market, symbol=symbol, quantity=quantity
+        )
+
+        return self._place_order(order_function)
+
+    def buy_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        order_function = partial(
+            rh_client.order_buy_limit,
+            symbol=symbol,
+            quantity=quantity,
+            limitPrice=limit_price,
+        )
+
+        return self._place_order(order_function)
+
+    def sell_market(self, symbol: str, quantity: int) -> Order:
+        order_function = partial(
+            rh_client.order_sell_market, symbol=symbol, quantity=quantity
+        )
+
+        return self._place_order(order_function)
+
+    def sell_limit(self, symbol: str, quantity: int, limit_price: float) -> Order:
+        order_function = partial(
+            rh_client.order_sell_limit,
+            symbol=symbol,
+            quantity=quantity,
+            limitPrice=limit_price,
+        )
+
+        return self._place_order(order_function)
+
+    def get_order_info(self, order_id: str) -> Order:
+        ts_event = time.time_ns()
+        try:
+            order_state = rh_client.get_stock_order_info(order_id)
+        except Exception as e:
+            self.logger.error(
+                f"{self.account_name} - Unexpected {type(e)} when getting order {order_id}"
+            )
+            self.logger.error(f"{self.account_name} - {e}")
+
+        self.orders[order_id].filled = order_state["state"] == "filled"
+        if self.orders[order_id].filled:
+            self.orders[order_id].state = "filled"
+        self.orders[order_id].cumulative_quantity = float(
+            order_state["cumulative_quantity"]
+        )
+        if order_state["average_price"]:
+            self.orders[order_id].avg_price = order_state["average_price"]
+
+        self.orders[order_id].events.append(
+            {"type": "get_order_info", "ts": ts_event, "order_state": order_state}
+        )
+
+        return self.orders[order_id]
+
+    def cancel_order(self, order_id: str) -> Order:
+        # Get the current state of the order
+        order = self.get_order_info(order_id)
+
+        if order.filled:
+            # Order filled, no need to cancel it
+            return order
+        else:
+            # Order isn't filled, need to cancel it
+            ts_cancel = time.time_ns()
+            resp = rh_client.cancel_stock_order(order_id)
+
+            if len(resp) == 0:
+                self.orders[order_id].state = "cancelled"
+            else:
+                self.logger.error(
+                    f"TDA - Failed to cancel order {order_id}. Received {resp}"
+                )
+
+            self.orders[order_id].events.append(
+                {"type": "cancel_order", "ts": ts_cancel, "resp": resp}
+            )
+
+            return self.orders[order_id]
+
+    def cleanup(self) -> None:
+        return
+
+    def _place_order(self, order_function: Callable):
+        """
+        Executes the order function and converts the response into an Order object
+        """
+        ts_order_submit = time.time_ns()
+        try:
+            resp = order_function()
+        except Exception as e:
+            self.logger.error(
+                f"{self.account_name} - Unexpected {type(e)} when placing order {order_function.keywords}"
+            )
+            self.logger.error(f"{self.account_name} - {e}")
+
+        try:
+            order_id = resp["id"]
+            self.orders[order_id] = Order(
+                order_id,
+                ts_order_submit,
+                order_function.keywords["symbol"],
+                resp["side"],
+                "live",
+                False,
+                -1,
+                order_function.keywords["quantity"],
+                0,
+                [],
+                [order_function.keywords, resp],
+            )
+
+            return self.orders[order_id]
+        except Exception as e:
+            self.logger.error(
+                f"{self.account_name} - Unexpected {type(e)} when parsing order"
+            )
+            self.logger.error(f"{self.account_name} - {e}")
+
+    def _setup_client(self):
+        """
+        Authenticates the robin_stocks library with HOOD. The library only
+        supports logging into a single account at a time
+        """
+        # Get login credentials
+        try:
+            secret = get_secret(self.id_secret)
+
+            username = secret[f"u_{self.account_name}"]
+            password = secret[f"p_{self.account_name}"]
+            otp_seed = secret[f"totp_{self.account_name}"]
+            self.logger.error(f"{self.account_name} - Successfully retrieved secrets")
+        except Exception as e:
+            self.logger.error(
+                f"{self.account_name} - Unexpected {type(e)} when getting secrets"
+            )
+            self.logger.error(f"{self.account_name} - {e}")
+
+        # Generate time-based one time password
+        try:
+            totp = pyotp.TOTP(otp_seed).now()
+            self.logger.error(f"{self.account_name} - Successfully got TOTP")
+        except Exception as e:
+            self.logger.error(
+                f"{self.account_name} - Unexpected {type(e)} when getting TOTP"
+            )
+            self.logger.error(f"{self.account_name} - {e}")
+
+        # Log into Robinhood
+        try:
+            login = rh_client.login(
+                username, password, mfa_code=totp, store_session=False, cred_path="/tmp"
+            )
+            self.logger.error(f"{self.account_name} - Successfully logged in")
+        except Exception as e:
+            self.logger.error(
+                f"{self.account_name} - Unexpected {type(e)} when logging into account"
+            )
+            self.logger.error(f"{self.account_name} - {e}")
+
+
 class PaperAccountPolygon(Broker):
     """
     Paper trading account implemented using data from Polygon.io
@@ -507,9 +825,8 @@ class PaperAccountPolygon(Broker):
     uri_quotes = "https://api.polygon.io/v3/quotes/{symbol}?timestamp.lte={timestamp}&limit={n}&order=desc"
     uri_trades = "https://api.polygon.io/v3/trades/{symbol}?timestamp.lte={timestamp}&limit={n}&order=desc"
 
-    def __init__(self, date=None) -> None:
-        super().__init__()
-
+    def __init__(self, logger, date=None) -> None:
+        self.logger = logger
         self.orders = []
         self.api_key = os.environ.get("PG_API_KEY")
         self.client = Session()
