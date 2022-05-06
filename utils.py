@@ -35,6 +35,24 @@ def put_secret(id_secret, secret):
     return True
 
 
+class RobustEncoder(json.JSONEncoder):
+    """
+    JSONEncoder that is robust to objects lacking a `to_json` method. Attempts
+    to serialize such objects using the __dict__ attribute and falls back to
+    a `str` representation when that fails.
+    """
+
+    def default(self, obj):
+        try:
+            return json.JSONEncoder.default(self, obj)
+        except TypeError:
+            try:
+                return obj.__dict__
+            except Exception as e:
+                print(f"Unexpected {type(e)} when encoding {obj}")
+                return str(obj)
+
+
 class PrintLogger:
     """
     Hack to print shit

@@ -1,4 +1,5 @@
 import argparse
+import base64
 from collections.abc import Callable
 import secrets
 from datetime import datetime
@@ -11,12 +12,11 @@ from multiprocessing import Queue
 import os
 import pickle
 import requests
-import threading
 import time
 
 import boto3
 from trading import Broker, PaperAccountPolygon, IBAccount, TDAAccount, RobinhoodAccount
-from utils import generate_experiment
+from utils import generate_experiment, RobustEncoder
 
 PG_API_KEY = os.environ.get("PG_API_KEY")
 MAX_WAIT_BEFORE_CANCEL_MIN = 5  # Minutes
@@ -343,7 +343,18 @@ def _observation_process(
     else:
         logger.info(f'Ob {observation["id"]} - Position never filled, no need to close')
 
-    logger.info(f'Ob {observation["id"]} - Final - {observation}')
+    try:
+        logger.info(
+            f'Ob {observation["id"]} - FINAL_JSON - {json.dumps(observation, cls=RobustEncoder)}'
+        )
+    except Exception as e:
+        logger.error(
+            f'Ob {observation["id"]} - Unexpected {type(e)} when serializing result to JSON'
+        )
+        logger.error(f'Ob {observation["id"]} - FINAL_STR - {observation}')
+    logger.info(
+        f'Ob {observation["id"]} - FINAL_PKL - {base64.b64encode(pickle.dumps(observation)).decode()}'
+    )
 
     final_results_queue.put_nowait(observation)
 
