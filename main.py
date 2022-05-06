@@ -464,6 +464,7 @@ if __name__ == "__main__":
     ts_max = max([ob["ts_close_utc_ns"] for ob in obs]) / 1e9
     t_sleep = ts_max - time.time() + 60
     logger.info(f"Sleeping for {t_sleep:.0f} while experiment runs")
+    time.sleep(t_sleep)
 
     # Let the experiment run
     logger.info("Joining observation processes")
