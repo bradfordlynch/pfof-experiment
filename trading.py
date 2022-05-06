@@ -905,6 +905,9 @@ class PaperAccountPolygon(Broker):
 
         return order
 
+    def cleanup(self) -> None:
+        return
+
     def _market_order(self, symbol: str, quantity: int, direction: str) -> Order:
         order_id = len(self.orders)
 

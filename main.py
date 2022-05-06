@@ -469,7 +469,8 @@ if __name__ == "__main__":
     # Let the experiment run
     logger.info("Joining observation processes")
     for worker in obs_procs:
-        worker.join(10)
+        worker.join(1)
+        logger.info(f"Joined {worker}")
     logger.info("All observation processes exited")
 
     # Shutdown trading processes
@@ -503,7 +504,9 @@ if __name__ == "__main__":
     s3.upload_file(
         Filename=fn_log, Bucket=args.aws_bucket, Key=os.path.join(exp_folder, fn_log)
     )
+    print("Uploaded logs")
 
     # Shut down logging
+    print("Shutting down logging")
     logging_queue.put_nowait(None)
     listener.join(10)
