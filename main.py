@@ -260,7 +260,7 @@ def _observation_process(
     msg = obs_queue.get()
     order = msg["order"]
     observation["ts_open_resp"] = time.time_ns()
-    logger.info(f'Ob {observation["id"]} - Opened position: {msg}')
+    logger.info(f'Ob {observation["id"]} - Placed order: {msg}')
     observation["events"].append(msg)
 
     # If the order didn't fill, then we wait until it does fill or
