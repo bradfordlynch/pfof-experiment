@@ -322,11 +322,12 @@ def _observation_process(
                 )
                 time.sleep(t_sleep)
 
-        # Get cancellation result
+        # Get order result
         msg = obs_queue.get()
         observation["events"].append(msg)
 
         # Get final state of order
+        time.sleep(5)  # Wait a few seconds before checking the state
         sell_order = msg["order"]
         account_queues[account_name].put_nowait(
             {
