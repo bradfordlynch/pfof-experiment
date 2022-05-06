@@ -60,7 +60,7 @@ class PrintLogger:
 
 
 def generate_experiment(
-    accounts=["Robinhood_Alpha", "TDA", "IBKR"], lag=10, n_orders=1
+    accounts=["Robinhood_Alpha", "TDA", "IBKR"], lag=10, n_orders=20
 ):
     today = datetime.now().strftime("%Y-%m-%d")
     i_obs = 0

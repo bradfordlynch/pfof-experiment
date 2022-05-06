@@ -165,7 +165,7 @@ def _trading_process(
 
         msg.update({"order": order, "t_acct_recv": t_recv, "t_acct_resp": t_resp})
 
-        observation_queues[msg["ob_id"]].put(msg)
+        observation_queues[msg["ob_id"]].put_nowait(msg)
 
 
 def _observation_process(
@@ -252,7 +252,7 @@ def _observation_process(
     while True:
         ts_now = time.time_ns()
         if ts_now >= ts_open_utc_ns:
-            account_queues[account_name].put(buy)
+            account_queues[account_name].put_nowait(buy)
             observation["ts_open_req"] = ts_now
             break
 
@@ -269,7 +269,7 @@ def _observation_process(
     while not order.filled:
         ts_now = time.time_ns()
         if ts_now >= ts_cancel:
-            account_queues[account_name].put(
+            account_queues[account_name].put_nowait(
                 {
                     "ob_id": observation["id"],
                     "action": "cancel",
@@ -311,7 +311,7 @@ def _observation_process(
             ts_now = time.time_ns()
             if ts_now >= ts_close_utc_ns:
                 # Shut'er down now
-                account_queues[account_name].put(sell)
+                account_queues[account_name].put_nowait(sell)
                 observation["ts_close_req"] = ts_now
                 break
             elif (ts_close_utc_ns - ts_now) / 1e9 >= 2:
@@ -328,7 +328,7 @@ def _observation_process(
 
         # Get final state of order
         sell_order = msg["order"]
-        account_queues[account_name].put(
+        account_queues[account_name].put_nowait(
             {
                 "ob_id": observation["id"],
                 "action": "get_order",
@@ -345,7 +345,7 @@ def _observation_process(
 
     logger.info(f'Ob {observation["id"]} - Final - {observation}')
 
-    final_results_queue.put(observation)
+    final_results_queue.put_nowait(observation)
 
     return None
 
@@ -475,7 +475,7 @@ if __name__ == "__main__":
 
     # Shutdown trading processes
     for k, q in account_queues.items():
-        q.put(None)
+        q.put_nowait(None)
 
     for worker in trading_procs:
         worker.join(10)
