@@ -461,10 +461,14 @@ if __name__ == "__main__":
         obs_procs.append(worker)
         worker.start()
 
+    ts_max = max([ob["ts_close_utc_ns"] for ob in obs]) / 1e9
+    t_sleep = ts_max - time.time() + 60
+    logger.info(f"Sleeping for {t_sleep:.0f} while experiment runs")
+
     # Let the experiment run
     logger.info("Joining observation processes")
     for worker in obs_procs:
-        worker.join()
+        worker.join(10)
     logger.info("All observation processes exited")
 
     # Shutdown trading processes
@@ -472,7 +476,7 @@ if __name__ == "__main__":
         q.put(None)
 
     for worker in trading_procs:
-        worker.join(5)
+        worker.join(10)
     logger.info("All account processes exited")
 
     # Put experiment results in S3
