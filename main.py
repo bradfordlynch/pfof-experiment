@@ -505,4 +505,4 @@ if __name__ == "__main__":
 
     # Shut down logging
     logging_queue.put_nowait(None)
-    listener.join()
+    listener.join(10)
