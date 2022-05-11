@@ -16,7 +16,7 @@ import time
 
 import boto3
 from trading import Broker, PaperAccountPolygon, IBAccount, TDAAccount, RobinhoodAccount
-from utils import generate_experiment, RobustEncoder
+from utils import generate_experiment, RobustEncoder, TelegramHook
 
 PG_API_KEY = os.environ.get("PG_API_KEY")
 MAX_WAIT_BEFORE_CANCEL_MIN = 5  # Minutes
@@ -58,6 +58,12 @@ def _parse_args():
         default="pfof-experiment",
         help="AWS bucket for storing experiment results",
     )
+    parser.add_argument(
+        "--telegram_chat_id",
+        type=str,
+        default=None,
+        help="Telegram chat Id for sending status updates",
+    )
     args = parser.parse_args()
 
     return args
@@ -79,13 +85,23 @@ def worker_configurer(queue: Queue) -> None:
     root.setLevel(logging.INFO)
 
 
-def _listener_process(queue: Queue, configurer: Callable, fn_log: str) -> None:
+def _listener_process(
+    queue: Queue,
+    configurer: Callable,
+    fn_log: str,
+    id_secret: str,
+    id_telegram_chat: str,
+) -> None:
     """Queue-based logger for logging to the same file from many processes
 
     https://docs.python.org/3/howto/logging-cookbook.html#logging-to-a-single-file-from-multiple-processes
     """
     configurer(fn_log)
     logger = logging.getLogger()
+
+    if id_telegram_chat:
+        telegram = TelegramHook(logger, id_secret, id_telegram_chat)
+
     while True:
         try:
             record = queue.get()
@@ -98,12 +114,22 @@ def _listener_process(queue: Queue, configurer: Callable, fn_log: str) -> None:
             print("Exception in logger", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
+        if id_telegram_chat:
+            try:
+                is_main = record.processName == "MainProcess"
+                is_error = record.levelname == "ERROR"
+                if is_main or is_error:
+                    telegram.send_message(record.message)
+            except Exception as e:
+                logger.error(f"Unexpected {type(e)} when sending Telegram message")
 
-def _setup_mp_logger(fn_log: str):
+
+def _setup_mp_logger(fn_log: str, id_secret: str, id_telegram_chat: str):
     """Sets up multiprocessing based logger"""
     queue = Queue(-1)
     listener = multiprocessing.Process(
-        target=_listener_process, args=(queue, _listener_configurer, fn_log)
+        target=_listener_process,
+        args=(queue, _listener_configurer, fn_log, id_secret, id_telegram_chat),
     )
     listener.start()
 
@@ -368,7 +394,9 @@ if __name__ == "__main__":
 
     # Setup logging
     fn_log = f'{args.exp.rsplit(".", 1)[0]}_{today}_{secrets.token_urlsafe(8)}.log'
-    logging_queue, logger, listener = _setup_mp_logger(fn_log)
+    logging_queue, logger, listener = _setup_mp_logger(
+        fn_log, args.aws_secret, args.telegram_chat_id
+    )
 
     # Load experiment design
     with open(args.exp, "r") as in_file:
