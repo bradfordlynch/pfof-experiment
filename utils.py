@@ -131,7 +131,7 @@ class TelegramHook:
 
 class PrintLogger:
     """
-    Hack to print shit
+    Hack to print log events to stdout
     """
 
     def __init__(self) -> None:
