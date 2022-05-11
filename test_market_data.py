@@ -37,7 +37,7 @@ def consumer_process(logger, observation, directives_queue, market_data_queue):
 
 
 if __name__ == "__main__":
-    tickers = ["IWM", "QQQ"]
+    tickers = ["QQQ", "AAPL", "SPY", "MSFT", "IWM"]
     obs = [{"id": i, "sub": f"Q.{ticker}"} for i, ticker in enumerate(tickers)]
     logger = PrintLogger()
     q_directives = Queue(-1)
@@ -60,7 +60,7 @@ if __name__ == "__main__":
     for consumer in consumers:
         consumer.start()
 
-    time.sleep(10)
+    time.sleep(20)
 
     logger.info("Joining processes")
     mdp.join(5)

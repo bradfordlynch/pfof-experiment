@@ -142,20 +142,21 @@ class PolygonWebsocketProvider(MarketDataProvider):
     async def _handle_message(self, msg):
         ts_received = time.time()
         messages = json.loads(msg)
-        for message in messages:
-            if message["ev"] == "status":
-                print(message)
-            else:
-                message["ts_recv"] = ts_received
-                stream = f"{message['ev']}.{message['sym']}"
+        message = messages[-1]
 
-                try:
-                    stream_receivers = self.subs[stream]
+        if message["ev"] == "status":
+            print(message)
+        else:
+            message["ts_recv"] = ts_received
+            stream = f"{message['ev']}.{message['sym']}"
 
-                    for id_recv in stream_receivers:
-                        self.receivers[id_recv].put(message)
-                except Exception as e:
-                    self.logger.error(f"Unexpected {type(e)} when processing message")
+            try:
+                stream_receivers = self.subs[stream]
+
+                for id_recv in stream_receivers:
+                    self.receivers[id_recv].put(message)
+            except Exception as e:
+                self.logger.error(f"Unexpected {type(e)} when processing message")
 
     def run(self):
         # async def handle_msg(msg, subscriptions=self.subs, receivers=self.receivers):
