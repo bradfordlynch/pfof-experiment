@@ -11,6 +11,7 @@ import multiprocessing
 from multiprocessing import Queue
 import os
 import pickle
+from queue import Empty
 import requests
 import time
 
@@ -23,6 +24,7 @@ MAX_WAIT_BEFORE_CANCEL_MIN = 5  # Minutes
 ACCOUNT_NAME_BROKER_MAP = {
     "IBKR": IBAccount,
     "TDA": TDAAccount,
+    "Robinhood": RobinhoodAccount,
 }
 
 
@@ -229,7 +231,14 @@ def _observation_process(
     time.sleep(t_sleep)
 
     # We need to get the NBBO to determine order size in shares and
-    # limit prices for non-market orders
+    # limit prices for non-market orders. This could be done using a
+    # websocket client to stream data directly from IBKR, TDA, or
+    # HOOD, but testing showed that all of these were slower than
+    # Polygon.io's feed which is located in the datacenters with NYSE,
+    # NASDAQ, BATS, IEX, etc. Further testing showed that Polygon.io's
+    # REST endpoint for the last NBBO provided the most up-to-date
+    # state of the market, with around 21ms latency. The websocket API
+    # was around 150ms (from us-east-1-nyc-1a).
     while True:
         # Average latency from Polygon is 21ms
         if time.time_ns() >= (ts_open_utc_ns - 22 * 1e6):
@@ -502,7 +511,7 @@ if __name__ == "__main__":
         worker.start()
 
     ts_max = max([ob["ts_close_utc_ns"] for ob in obs]) / 1e9
-    t_sleep = ts_max - time.time() + 60
+    t_sleep = ts_max - time.time() + 60  # MUST BE IN SECONDS FOR time.sleep
     logger.info(f"Sleeping for {t_sleep:.0f} while experiment runs")
     time.sleep(t_sleep)
 
@@ -530,8 +539,10 @@ if __name__ == "__main__":
     while True:
         try:
             results.append(final_results_queue.get_nowait())
-        except:
+        except Empty:
             break
+        except Exception as e:
+            logger.error(f"Unexpected {type(e)} when collecting final results")
 
     s3.put_object(
         Bucket=args.aws_bucket,

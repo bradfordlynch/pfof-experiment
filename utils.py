@@ -36,9 +36,7 @@ def put_secret(id_secret, secret):
     return True
 
 
-def generate_experiment(
-    accounts=["Robinhood_Alpha", "TDA", "IBKR"], lag=10, n_orders=1
-):
+def generate_experiment(accounts=["Robinhood_Noise"], lag=10, n_orders=2):
     today = datetime.now().strftime("%Y-%m-%d")
     i_obs = 0
     obs = []
@@ -59,7 +57,7 @@ def generate_experiment(
                     "order_size": 1,  # Dollars
                 }
                 if order_type == "limit":
-                    ob.update({"order_type": order_type, "limit_price": -50})
+                    ob.update({"order_type": order_type, "limit_price": -100})
                 elif order_type == "market":
                     ob.update(
                         {
