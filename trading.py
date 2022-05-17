@@ -44,7 +44,6 @@ class Order:
     avg_price: float
     quantity: int
     cumulative_quantity: int
-    executions: list
     events: list
 
     def dollar_volume(self):
@@ -396,7 +395,6 @@ class IBAccount(Broker, EWrapper, EClient):
             ib_order.totalQuantity,
             0,
             [],
-            [],
         )
         self.placeOrder(order_id, contract, ib_order)
         self.nextorderId += 1
@@ -545,7 +543,6 @@ class TDAAccount(Broker):
             tda_order["orderLegCollection"][0]["quantity"],
             0,
             [],
-            [],
         )
 
         return self.orders[order_id]
@@ -691,6 +688,7 @@ class RobinhoodAccount(Broker):
                 f"{self.account_name} - Unexpected {type(e)} when getting order {order_id}"
             )
             self.logger.error(f"{self.account_name} - {e}")
+            return self.orders[order_id]
 
         self.orders[order_id].filled = order_state["state"] == "filled"
         if self.orders[order_id].filled:
@@ -723,7 +721,7 @@ class RobinhoodAccount(Broker):
                 self.orders[order_id].state = "cancelled"
             else:
                 self.logger.error(
-                    f"TDA - Failed to cancel order {order_id}. Received {resp}"
+                    f"Robinhood - Failed to cancel order {order_id}. Received {resp}"
                 )
 
             self.orders[order_id].events.append(
@@ -760,7 +758,6 @@ class RobinhoodAccount(Broker):
                 -1,
                 order_function.keywords["quantity"],
                 0,
-                [],
                 [order_function.keywords, resp],
             )
 
@@ -770,6 +767,7 @@ class RobinhoodAccount(Broker):
                 f"{self.account_name} - Unexpected {type(e)} when parsing order"
             )
             self.logger.error(f"{self.account_name} - {e}")
+            self.logger.error(f"{self.account_name} - {resp}")
 
     def _setup_client(self):
         """
@@ -940,7 +938,6 @@ class PaperAccountPolygon(Broker):
                 quantity,
                 quantity,
                 [],
-                [],
             )
         )
 
@@ -997,7 +994,6 @@ class PaperAccountPolygon(Broker):
                 avg_price,
                 quantity,
                 cumulative_quantity,
-                [],
                 [],
             )
         )

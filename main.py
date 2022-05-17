@@ -364,18 +364,23 @@ def _observation_process(
         # Get final state of order
         time.sleep(5)  # Wait a few seconds before checking the state
         sell_order = msg["order"]
-        account_queues[account_name].put_nowait(
-            {
-                "ob_id": observation["id"],
-                "action": "get_order",
-                "order_id": sell_order.order_id,
-            }
-        )
-        msg = obs_queue.get()
-        sell_order = msg["order"]
-        observation["order_to_close"] = sell_order
-        logger.info(f'Ob {observation["id"]} - Closed position: {msg}')
-        observation["events"].append(msg)
+        try:
+            account_queues[account_name].put_nowait(
+                {
+                    "ob_id": observation["id"],
+                    "action": "get_order",
+                    "order_id": sell_order.order_id,
+                }
+            )
+            msg = obs_queue.get()
+            sell_order = msg["order"]
+            observation["order_to_close"] = sell_order
+            logger.info(f'Ob {observation["id"]} - Closed position: {msg}')
+            observation["events"].append(msg)
+        except Exception as e:
+            logger.error(
+                f'Ob {observation["id"]} - Unexpected {type(e)} when closing position'
+            )
     else:
         logger.info(f'Ob {observation["id"]} - Position never filled, no need to close')
 
