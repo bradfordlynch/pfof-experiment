@@ -332,6 +332,27 @@ def _observation_process(
 
     observation["order_to_open"] = order
 
+    # Log intermeadiate results
+    try:
+        logger.info(
+            f'Ob {observation["id"]} - POST_BUY_JSON - {json.dumps(observation, cls=RobustEncoder)}'
+        )
+    except Exception as e:
+        logger.error(
+            f'Ob {observation["id"]} - Unexpected {type(e)} when serializing buy result to JSON'
+        )
+        logger.error(f'Ob {observation["id"]} - POST_BUY_STR_JSON - {observation}')
+
+    try:
+        logger.info(
+            f'Ob {observation["id"]} - POST_BUY_PKL - {base64.b64encode(pickle.dumps(observation)).decode()}'
+        )
+    except Exception as e:
+        logger.error(
+            f'Ob {observation["id"]} - Unexpected {type(e)} when pickling buy result'
+        )
+        logger.error(f'Ob {observation["id"]} - POST_BUY_STR_PKL - {observation}')
+
     # Prepare to sell position
     if order.cumulative_quantity > 0:
         sell = {
@@ -390,12 +411,19 @@ def _observation_process(
         )
     except Exception as e:
         logger.error(
-            f'Ob {observation["id"]} - Unexpected {type(e)} when serializing result to JSON'
+            f'Ob {observation["id"]} - Unexpected {type(e)} when serializing final result to JSON'
         )
-        logger.error(f'Ob {observation["id"]} - FINAL_STR - {observation}')
-    logger.info(
-        f'Ob {observation["id"]} - FINAL_PKL - {base64.b64encode(pickle.dumps(observation)).decode()}'
-    )
+        logger.error(f'Ob {observation["id"]} - FINAL_STR_JSON - {observation}')
+
+    try:
+        logger.info(
+            f'Ob {observation["id"]} - FINAL_PKL - {base64.b64encode(pickle.dumps(observation)).decode()}'
+        )
+    except Exception as e:
+        logger.error(
+            f'Ob {observation["id"]} - Unexpected {type(e)} when pickling final result'
+        )
+        logger.error(f'Ob {observation["id"]} - FINAL_STR_PKL - {observation}')
 
     final_results_queue.put_nowait(observation)
 
