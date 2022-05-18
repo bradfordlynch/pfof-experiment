@@ -120,7 +120,8 @@ def _listener_process(
             try:
                 is_main = record.processName == "MainProcess"
                 is_error = record.levelname == "ERROR"
-                if is_main or is_error:
+                is_ibkr_warn = "Order Event Warning" in record.message
+                if (is_main or is_error) and not is_ibkr_warn:
                     telegram.send_message(record.message)
             except Exception as e:
                 logger.error(f"Unexpected {type(e)} when sending Telegram message")

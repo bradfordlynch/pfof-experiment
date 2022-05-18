@@ -20,5 +20,5 @@ export AWS_DEFAULT_REGION="your-aws-region"
 
 ## Running an experiment
 ```
-python main.py --exp noise_trade_test.json --gen_experiment True --telegram_chat_id 1387574277
+python main.py --exp pfof_experiment.json --telegram_chat_id 1387574277
 ```
