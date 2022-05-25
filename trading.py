@@ -745,6 +745,7 @@ class RobinhoodAccount(Broker):
                 f"{self.account_name} - Unexpected {type(e)} when placing order {order_function.keywords}"
             )
             self.logger.error(f"{self.account_name} - {e}")
+            return None
 
         try:
             order_id = resp["id"]

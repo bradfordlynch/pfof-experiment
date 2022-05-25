@@ -166,40 +166,47 @@ def _trading_process(
     account = account_constructor(logger)
 
     while True:
-        msg = action_queue.get()
-        t_recv = time.time_ns()
+        # Accounts try to handle errors gracefully but wrap the trading loop
+        # in a try/except block to catch anything unexpected
+        try:
+            msg = action_queue.get()
+            t_recv = time.time_ns()
 
-        if msg is None:
-            # Stop signal
-            account.cleanup()
-            break
+            if msg is None:
+                # Stop signal
+                account.cleanup()
+                break
 
-        if msg["action"] == "buy":
-            if msg["order_type"] == "market":
-                order = account.buy_market(msg["symbol"], msg["quantity"])
+            if msg["action"] == "buy":
+                if msg["order_type"] == "market":
+                    order = account.buy_market(msg["symbol"], msg["quantity"])
+                else:
+                    order = account.buy_limit(
+                        msg["symbol"], msg["quantity"], msg["limit_price"]
+                    )
+            elif msg["action"] == "sell":
+                if msg["order_type"] == "market":
+                    order = account.sell_market(msg["symbol"], msg["quantity"])
+                else:
+                    order = account.sell_limit(
+                        msg["symbol"], msg["quantity"], msg["limit_price"]
+                    )
+            elif msg["action"] == "cancel":
+                order = account.cancel_order(msg["order_id"])
+            elif msg["action"] == "get_order":
+                order = account.get_order_info(msg["order_id"])
             else:
-                order = account.buy_limit(
-                    msg["symbol"], msg["quantity"], msg["limit_price"]
-                )
-        elif msg["action"] == "sell":
-            if msg["order_type"] == "market":
-                order = account.sell_market(msg["symbol"], msg["quantity"])
-            else:
-                order = account.sell_limit(
-                    msg["symbol"], msg["quantity"], msg["limit_price"]
-                )
-        elif msg["action"] == "cancel":
-            order = account.cancel_order(msg["order_id"])
-        elif msg["action"] == "get_order":
-            order = account.get_order_info(msg["order_id"])
-        else:
-            raise NotImplementedError(f"Unsupported action: {msg['action']}")
+                raise NotImplementedError(f"Unsupported action: {msg['action']}")
 
-        t_resp = time.time_ns()
+            t_resp = time.time_ns()
 
-        msg.update({"order": order, "t_acct_recv": t_recv, "t_acct_resp": t_resp})
+            msg.update({"order": order, "t_acct_recv": t_recv, "t_acct_resp": t_resp})
 
-        observation_queues[msg["ob_id"]].put_nowait(msg)
+            observation_queues[msg["ob_id"]].put_nowait(msg)
+        except Exception as e:
+            logger.critical(
+                f"{account.account_name} - Unexpected {type(e)} when trading {msg}"
+            )
 
 
 def _observation_process(
@@ -300,6 +307,15 @@ def _observation_process(
     # Wait for response from trading account
     msg = obs_queue.get()
     order = msg["order"]
+
+    # If order is None then there was some catastrophic error
+    if order is None:
+        logger.critical(
+            f'Ob {observation["id"]} - Error opening position for {symbol}: {msg}'
+        )
+        return None
+
+    # Successfully placed order to open position
     observation["ts_open_resp"] = time.time_ns()
     logger.info(f'Ob {observation["id"]} - Placed order: {msg}')
     observation["events"].append(msg)
@@ -502,7 +518,7 @@ if __name__ == "__main__":
                 )
             elif account_type == "Robinhood":
                 try:
-                    assert n_hood == 0
+                    # assert n_hood == 0
                     n_hood += 1
                 except AssertionError:
                     raise NotImplementedError(
