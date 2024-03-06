@@ -159,18 +159,6 @@ class PolygonWebsocketProvider(MarketDataProvider):
                 self.logger.error(f"Unexpected {type(e)} when processing message")
 
     def run(self):
-        # async def handle_msg(msg, subscriptions=self.subs, receivers=self.receivers):
-        #     messages = json.loads(msg)
-        #     for message in messages:
-        #         if message["ev"] == "status":
-        #             print(message)
-        #         else:
-        #             stream = f"{message['ev']}.{message['sym']}"
-        #             stream_receivers = subscriptions[stream]
-
-        #             for recv in stream_receivers:
-        #                 receivers[recv].put(message)
-
         print("Starting asyncio event loop")
         asyncio.run(self._connect(self._handle_message))
         print("After event loop")
